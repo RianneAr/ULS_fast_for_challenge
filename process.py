@@ -86,11 +86,21 @@ class Uls23(SegmentationAlgorithm):
                 voi = image_data[self.z_size * i:self.z_size * (i + 1), :, :]
                 # Note: spacings[i] contains the scan spacing for this VOI
 
-                # Unstack the VOI's, perform optional preprocessing and save
-                # them to individual binary files for memory-efficient access
-                print(voi.shape)
-                voi = voi[32:96, 64:192, 64:192]
-                np.save(f"/tmp/voi_{i}.npy", np.array([voi])) # Add dummy batch dimension for nnUnet
+                # Convert the VOI back to a SimpleITK image to preserve metadata
+                voi_image = sitk.GetImageFromArray(voi)
+                voi_image.CopyInformation(self.image_metadata)
+
+                # Define the cropping region in physical space
+                start_index = [32, 64, 64]  # Start indices for cropping
+                end_index = [96, 192, 192]  # End indices for cropping
+                crop_size = [end - start for start, end in zip(start_index, end_index)]
+
+                # Perform cropping using SimpleITK
+                voi_cropped = sitk.RegionOfInterest(voi_image, size=crop_size, index=start_index)
+
+                # Save the cropped VOI to a binary file
+                voi_cropped_array = sitk.GetArrayFromImage(voi_cropped)
+                np.save(f"/tmp/voi_{i}.npy", np.array([voi_cropped_array]))  # Add dummy batch dimension for nnUnet
 
         end_load_time = time.time()
         print(f"Data pre-processing runtime: {end_load_time - start_load_time}s")
@@ -133,17 +143,35 @@ class Uls23(SegmentationAlgorithm):
                 segmentation[instance_mask != instance_mask[
                     int(self.z_size / 2), int(self.xy_size / 2), int(self.xy_size / 2)]] = 0
                 segmentation[segmentation != 0] = 1
-            
+
             # Pad segmentations to fit with original image size
             segmentation_pad = np.pad(segmentation, 
-                      ((32, 32),  
-                       (64, 64),   
-                       (64, 64)),
-                      mode='constant', constant_values=0)
-            
-            predictions[i] = segmentation_pad
+                    ((32, 32),  
+                    (64, 64),   
+                    (64, 64)),
+                    mode='constant', constant_values=0)
 
-        predictions = np.concatenate(predictions, axis=0) # Stack predictions
+            # Convert padded segmentation back to a SimpleITK image
+            segmentation_image = sitk.GetImageFromArray(segmentation_pad)
+
+            # Update the origin to account for the padding
+            original_origin = self.image_metadata.GetOrigin()
+            original_spacing = self.image_metadata.GetSpacing()
+            new_origin = [
+                original_origin[0] - 64 * original_spacing[0],  # Adjust for x padding
+                original_origin[1] - 64 * original_spacing[1],  # Adjust for y padding
+                original_origin[2] - 32 * original_spacing[2],  # Adjust for z padding
+            ]
+            segmentation_image.SetOrigin(new_origin)
+
+            # Copy the direction and spacing from the original metadata
+            segmentation_image.SetDirection(self.image_metadata.GetDirection())
+            segmentation_image.SetSpacing(self.image_metadata.GetSpacing())
+
+            # Save the updated segmentation image
+            predictions[i] = sitk.GetArrayFromImage(segmentation_image)
+
+        predictions = np.concatenate(predictions, axis=0)  # Stack predictions
 
         # Create mask image and copy over metadata
         mask = sitk.GetImageFromArray(predictions)
@@ -154,7 +182,6 @@ class Uls23(SegmentationAlgorithm):
         print("Output batched image shape:", predictions.shape)
         end_postprocessing_time = time.time()
         print(f"Postprocessing & saving runtime: {end_postprocessing_time - start_postprocessing_time}s")
-
 
 if __name__ == "__main__":
     Uls23().start_pipeline()
